@@ -13,6 +13,7 @@
     "@react-three/drei": "^10.7.6",
     "@react-three/fiber": "^9.4.0",
     "@react-three/postprocessing": "^3.0.4",
+    "gh": "^2.5.0",
     "leva": "^0.10.1",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
