@@ -1,16 +1,13 @@
-// App.jsx
-import { Canvas } from '@react-three/fiber'
-import { OrbitControls } from '@react-three/drei'
+import React from 'react';
+import MainSection from './components/MainSection';
+import './App.css';
 
-export default function App() {
+function App() {
   return (
-    <Canvas camera={{ position: [0, 0, 5] }}>
-      <ambientLight />
-      <mesh>
-        <boxGeometry />
-        <meshStandardMaterial color="hotpink" />
-      </mesh>
-      <OrbitControls />
-    </Canvas>
-  )
+    <div className="App">
+      <MainSection />
+    </div>
+  );
 }
+
+export default App;

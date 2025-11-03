@@ -14,10 +14,12 @@
     "@react-three/fiber": "^9.4.0",
     "@react-three/postprocessing": "^3.0.4",
     "gh": "^2.5.0",
+    "gsap": "^3.13.0",
     "leva": "^0.10.1",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
-    "three": "^0.181.0"
+    "three": "^0.181.0",
+    "three-stdlib": "^2.36.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.36.0",
