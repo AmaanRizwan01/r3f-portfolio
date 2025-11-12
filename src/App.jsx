@@ -18,6 +18,59 @@ const DARK_MATTE = {
   darkenFactor: 0.85
 }
 
+// Injects a "splash" reveal shader into a material
+function injectSplashShader(mat, introUniforms) {
+  mat.onBeforeCompile = (shader) => {
+    // Pass our custom uniforms to the shader
+    shader.uniforms.uIntroProgress = introUniforms.uIntroProgress
+    shader.uniforms.uIntroStartPoint = introUniforms.uIntroStartPoint
+    shader.uniforms.uTime = introUniforms.uTime
+
+    // Add uniforms to the GLSL code
+    shader.vertexShader = `
+      varying vec3 vWorldPosition;
+      ${shader.vertexShader}
+    `.replace(
+      `#include <begin_vertex>`,
+      `#include <begin_vertex>
+      vWorldPosition = (modelMatrix * vec4(transformed, 1.0)).xyz;`
+    )
+    
+    shader.fragmentShader = `
+      uniform float uIntroProgress;
+      uniform vec3 uIntroStartPoint;
+      uniform float uTime;
+      varying vec3 vWorldPosition;
+      ${shader.fragmentShader}
+    `.replace(
+      `#include <dithering_fragment>`,
+      `#include <dithering_fragment>
+      
+      float dist = distance(vWorldPosition, uIntroStartPoint);
+      float revealRadius = uIntroProgress * 15.0; // Max radius of reveal
+      float edgeWidth = 2.0;
+
+      // Ripple effect for the edge
+      float ripple = sin(dist * 2.0 - uTime * 4.0) * 0.5 + 0.5;
+      
+      float op = smoothstep(revealRadius - edgeWidth, revealRadius, dist);
+      float finalOpacity = mix(1.0, 0.0, op);
+      
+      // Add ripple only at the edge
+      if (dist > revealRadius - edgeWidth && dist < revealRadius) {
+        finalOpacity *= ripple;
+      }
+      
+      if (finalOpacity < 0.01) {
+        discard;
+      }
+
+      gl_FragColor = vec4(gl_FragColor.rgb, gl_FragColor.a * finalOpacity);
+      `
+    )
+  }
+}
+
 // Identify particle materials by name
 function isParticleMaterialName(name) {
   if (!name) return false
@@ -25,8 +78,8 @@ function isParticleMaterialName(name) {
   return n === 'emission' || n.includes('emiss') || n.includes('particle') || n.includes('fx') || n.includes('glow')
 }
 
-// Force DARK matte shuttle and collect particle meshes for selective bloom
-function tuneDarkMatte(root, onGlowTargets) {
+// Merged material properties for desired lighting with intro animation compatibility
+function tuneDarkMatte(root, onGlowTargets, introUniforms) {
   const glow = []
   root.traverse((child) => {
     if (child.isLight) {
@@ -62,7 +115,7 @@ function tuneDarkMatte(root, onGlowTargets) {
           mat.emissiveIntensity = 4.8
         }
         mat.toneMapped = false
-        mat.transparent = false
+        mat.transparent = true // Kept for intro animation
         mat.depthWrite = true
         mat.depthTest = true
         mat.blending = THREE.NormalBlending
@@ -70,27 +123,29 @@ function tuneDarkMatte(root, onGlowTargets) {
         mat.polygonOffset = true
         mat.polygonOffsetFactor = 1
         mat.polygonOffsetUnits = 1
-
+        
         glow.push(child)
         child.renderOrder = Math.max(child.renderOrder || 0, 2)
       } else {
         if ('metalness' in mat) mat.metalness = DARK_MATTE.metalness
         if ('roughness' in mat) mat.roughness = DARK_MATTE.roughness
         if ('envMapIntensity' in mat) mat.envMapIntensity = DARK_MATTE.envMapIntensity
-
         if ('specularIntensity' in mat) mat.specularIntensity = 0.08
         if ('specularColor' in mat) mat.specularColor.set('#ffffff')
         if ('clearcoat' in mat) { mat.clearcoat = 0; mat.clearcoatRoughness = 1 }
         if ('sheen' in mat) mat.sheen = 0
-
+        if ('emissiveIntensity' in mat) mat.emissiveIntensity = 0
+        
         if (mat.color) mat.color.multiplyScalar(DARK_MATTE.darkenFactor)
 
-        if ('emissiveIntensity' in mat) mat.emissiveIntensity = 0
         mat.toneMapped = true
-        mat.transparent = false
+        mat.transparent = true // Kept for intro animation
         mat.blending = THREE.NormalBlending
         mat.side = THREE.FrontSide
       }
+
+      // Inject the splash shader into every material
+      injectSplashShader(mat, introUniforms)
 
       mat.needsUpdate = true
     })
@@ -108,6 +163,7 @@ function makePerfectLoopClip(src) {
     const times = Array.from(track.times)
     const values = Array.from(track.values)
     const stride = track.getValueSize()
+    if (!times.length) return track
 
     if (Math.abs(times[0]) > 1e-6) times[0] = 0
     const hasEndKey = Math.abs(times[times.length - 1] - dur) < 1e-6
@@ -127,17 +183,12 @@ function makePerfectLoopClip(src) {
       const li = values.length - stride
       const qL = new THREE.Quaternion(values[li], values[li+1], values[li+2], values[li+3]).normalize()
       if (q0.dot(qL) < 0) {
-        values[li]   = -qL.x
-        values[li+1] = -qL.y
-        values[li+2] = -qL.z
-        values[li+3] = -qL.w
+        values[li]   = -qL.x; values[li+1] = -qL.y; values[li+2] = -qL.z; values[li+3] = -qL.w
       }
     }
 
     const Typed = track.constructor
-    const tArr = new Float32Array(times)
-    const vArr = new Float32Array(values)
-    const newTrack = new Typed(track.name, tArr, vArr)
+    const newTrack = new Typed(track.name, new Float32Array(times), new Float32Array(values))
     newTrack.setInterpolation(THREE.InterpolateLinear)
     return newTrack
   })
@@ -145,8 +196,41 @@ function makePerfectLoopClip(src) {
   return clip
 }
 
-// Model + animation
-function SpaceStation({ scale = 0.6, onGlowTargets }) {
+// --- **UPDATED** INTRO WIREFRAME COMPONENT ---
+function IntroWireframe({ scene, scale }) {
+  const wireframes = useMemo(() => {
+    const wires = []
+    scene.traverse((child) => {
+      // **FIX APPLIED HERE**: Check if the child is a mesh AND its name is NOT 'light_0'
+      if (child.isMesh && child.name !== 'light_0') {
+        const edges = new THREE.EdgesGeometry(child.geometry, 30)
+        const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
+            color: '#ffffff',
+            transparent: true,
+            opacity: 0.75,
+            polygonOffset: true,
+            polygonOffsetFactor: -1,
+            polygonOffsetUnits: -1,
+        }))
+        line.position.copy(child.position)
+        line.rotation.copy(child.rotation)
+        line.scale.copy(child.scale)
+        wires.push(line)
+      }
+    })
+    return wires
+  }, [scene])
+
+  return (
+    <group scale={scale}>
+      {wireframes.map((wire, i) => (
+        <primitive key={i} object={wire} />
+      ))}
+    </group>
+  )
+}
+
+function SpaceStation({ scale = 0.6, onGlowTargets, introUniforms }) {
   const group = useRef()
   const gltf = useGLTF('/models/space_station_4.glb')
   const { scene, animations } = gltf
@@ -157,9 +241,9 @@ function SpaceStation({ scale = 0.6, onGlowTargets }) {
   const transitionRef = useRef({ progress: 0, from: 0.5, to: 0.5 })
 
   const FORWARD_SPEED = 0.5
-  const REVERSE_SPEED = -0.25
-  const BRAKE_DURATION = 2.2
-  const ACCEL_DURATION = 2.8
+  const REVERSE_SPEED = -0.35
+  const BRAKE_DURATION = 5.8
+  const ACCEL_DURATION = 4.0
 
   const clipToPlay = useMemo(() => {
     return names.find((n) => /idle|loop|main|base|take|anim|action/i.test(n)) ||
@@ -167,7 +251,7 @@ function SpaceStation({ scale = 0.6, onGlowTargets }) {
   }, [names, clips])
 
   useEffect(() => {
-    tuneDarkMatte(scene, onGlowTargets)
+    tuneDarkMatte(scene, onGlowTargets, introUniforms)
     Object.values(actions).forEach((a) => a?.stop())
 
     if (clipToPlay) {
@@ -176,12 +260,9 @@ function SpaceStation({ scale = 0.6, onGlowTargets }) {
       const act = clip ? mixer.clipAction(clip, group.current) : actions[clipToPlay]
 
       if (act) {
-        act.reset()
-        act.setLoop(THREE.LoopRepeat, Infinity)
+        act.reset().setLoop(THREE.LoopRepeat, Infinity).play()
         act.clampWhenFinished = false
         act.timeScale = FORWARD_SPEED
-        act.play()
-
         actionRef.current = act
         transitionRef.current = { progress: 1, from: FORWARD_SPEED, to: FORWARD_SPEED }
 
@@ -191,9 +272,7 @@ function SpaceStation({ scale = 0.6, onGlowTargets }) {
         }
       }
     }
-
-    return () => Object.values(actions).forEach((a) => a?.stop())
-  }, [actions, clipToPlay, clips, mixer, onGlowTargets, scene, group])
+  }, [actions, clipToPlay, clips, mixer, onGlowTargets, scene, group, introUniforms])
 
   const handleOver = (e) => {
     e.stopPropagation()
@@ -223,12 +302,7 @@ function SpaceStation({ scale = 0.6, onGlowTargets }) {
 
     if (trans.progress < 1) {
       trans.progress = Math.min(1, trans.progress + dt / duration)
-      let t
-      if (hoveredRef.current) {
-        t = easeOutExpo(trans.progress)
-      } else {
-        t = easeInOutCubic(trans.progress)
-      }
+      const t = hoveredRef.current ? easeOutExpo(trans.progress) : easeInOutCubic(trans.progress)
       const speed = trans.from + (trans.to - trans.from) * t
       act.timeScale = Math.abs(speed) < 0.005 ? 0 : speed
     } else {
@@ -245,6 +319,67 @@ function SpaceStation({ scale = 0.6, onGlowTargets }) {
         onPointerOut={handleOut}
       />
     </group>
+  )
+}
+
+function SceneContent() {
+  const [glowSelection, setGlowSelection] = useState([])
+  const [introFinished, setIntroFinished] = useState(false)
+  
+  const introProgressRef = useRef({ value: 0 })
+  
+  const introUniforms = useMemo(() => ({
+    uIntroProgress: introProgressRef.current,
+    uIntroStartPoint: { value: new THREE.Vector3(0, 0, 0) },
+    uTime: { value: 0 },
+  }), [])
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      introProgressRef.current.isAnimating = true
+    }, 1500)
+    return () => clearTimeout(timer)
+  }, [])
+  
+  useFrame((state, dt) => {
+    introUniforms.uTime.value = state.clock.elapsedTime
+    if (introProgressRef.current.isAnimating && introProgressRef.current.value < 1) {
+      introProgressRef.current.value += dt / 2.5 // Animation duration
+      introProgressRef.current.value = Math.min(introProgressRef.current.value, 1)
+      if (introProgressRef.current.value >= 1) {
+        setIntroFinished(true)
+      }
+    }
+  })
+
+  const gltf = useGLTF('/models/space_station_4.glb')
+
+  return (
+    <>
+      <ParallaxRig>
+        <ColoredStars count={1200} radius={120} depth={40} />
+        <StarFlares count={100} radius={115} minIdle={1.0} maxIdle={3.0} minDur={1.6} maxDur={2.6} />
+        <NebulaFog color="#0c1840" opacity={0.05} scale={200} />
+
+        <spotLight castShadow color="#ffffff" intensity={1.35} angle={0.55} penumbra={0.9} position={[6, 6, 6]} distance={35} shadow-bias={-0.00025} shadow-normalBias={0.03} shadow-mapSize-width={2048} shadow-mapSize-height={2048} />
+        <directionalLight color="#9ec2ff" intensity={1.65} position={[-6, 3, 4]} />
+        <directionalLight color="#9ec2ff" intensity={1.65} position={[-6, 3, -4]} />
+        <directionalLight color="#9ec2ff" intensity={3.65} position={[6, 3, -4]} />
+        <ambientLight intensity={5.0} />
+        <hemisphereLight intensity={1.12} color="#dfe7ff" groundColor="#0b0b10" />
+
+        <Suspense fallback={null}>
+          <Environment preset="night" background={false} blur={0.2} />
+          {!introFinished && <IntroWireframe scene={gltf.scene} scale={0.6} />}
+          <SpaceStation scale={0.6} onGlowTargets={setGlowSelection} introUniforms={introUniforms} />
+        </Suspense>
+      </ParallaxRig>
+
+      <EffectComposer disableNormalPass>
+        <SelectiveBloom selection={glowSelection} intensity={2.5} radius={0.75} luminanceThreshold={0} luminanceSmoothing={0} mipmapBlur />
+        <Vignette eskil offset={0.18} darkness={0.58} />
+      </EffectComposer>
+    </>
   )
 }
 
@@ -277,14 +412,7 @@ function NebulaFog({ color = '#0a1636', opacity = 0.07, scale = 180 }) {
   return (
     <mesh scale={scale}>
       <sphereGeometry args={[1, 32, 32]} />
-      <meshBasicMaterial
-        color={color}
-        side={THREE.BackSide}
-        transparent
-        opacity={opacity}
-        depthWrite={false}
-        blending={THREE.AdditiveBlending}
-      />
+      <meshBasicMaterial color={color} side={THREE.BackSide} transparent opacity={opacity} depthWrite={false} blending={THREE.AdditiveBlending} />
     </mesh>
   )
 }
@@ -310,15 +438,7 @@ function useFlareTexture() {
 }
 
 function StarFlares({
-  count = 100,
-  radius = 115,
-  minIdle = 1.0,
-  maxIdle = 3.0,
-  minDur = 1.6,
-  maxDur = 2.6,
-  baseScale = 0.18,
-  maxScale = 1.1,
-  color = '#a6c8ff'
+  count = 100, radius = 115, minIdle = 1.0, maxIdle = 3.0, minDur = 1.6, maxDur = 2.6, baseScale = 0.18, maxScale = 1.1, color = '#a6c8ff'
 }) {
   const matTex = useFlareTexture()
   const refs = useRef([])
@@ -329,19 +449,11 @@ function StarFlares({
     const u = Math.random(), v = Math.random()
     const theta = 2 * Math.PI * u
     const phi = Math.acos(2 * v - 1)
-    return new THREE.Vector3(
-      r * Math.sin(phi) * Math.cos(theta),
-      r * Math.sin(phi) * Math.sin(theta),
-      r * Math.cos(phi)
-    )
+    return new THREE.Vector3(r * Math.sin(phi) * Math.cos(theta), r * Math.sin(phi) * Math.sin(theta), r * Math.cos(phi))
   }
 
   useMemo(() => {
-    states.current = Array.from({ length: count }).map(() => ({
-      t: -(rand(minIdle, maxIdle)),
-      dur: rand(minDur, maxDur),
-      pos: randOnSphere(radius)
-    }))
+    states.current = Array.from({ length: count }).map(() => ({ t: -(rand(minIdle, maxIdle)), dur: rand(minDur, maxDur), pos: randOnSphere(radius) }))
   }, [count, minIdle, maxIdle, minDur, maxDur, radius])
 
   useFrame((_, dt) => {
@@ -371,23 +483,8 @@ function StarFlares({
   return (
     <group frustumCulled={false}>
       {Array.from({ length: count }).map((_, i) => (
-        <sprite
-          key={i}
-          ref={(el) => (refs.current[i] = el)}
-          position={states.current[i]?.pos || [0, 0, -radius]}
-          scale={[baseScale, baseScale, 1]}
-          frustumCulled={false}
-        >
-          <spriteMaterial
-            map={matTex}
-            color={color}
-            transparent
-            opacity={0}
-            depthWrite={false}
-            depthTest
-            blending={THREE.AdditiveBlending}
-            toneMapped={false}
-          />
+        <sprite key={i} ref={(el) => (refs.current[i] = el)} position={states.current[i]?.pos || [0, 0, -radius]} scale={[baseScale, baseScale, 1]} frustumCulled={false}>
+          <spriteMaterial map={matTex} color={color} transparent opacity={0} depthWrite={false} depthTest blending={THREE.AdditiveBlending} toneMapped={false} />
         </sprite>
       ))}
     </group>
@@ -465,51 +562,19 @@ function ColoredStars({ count = 1200, radius = 120, depth = 40, small=0.65, medi
   return (
     <group frustumCulled={false}>
       <points geometry={geoSmall} frustumCulled={false}>
-        <pointsMaterial
-          map={starTex}
-          vertexColors
-          transparent
-          opacity={0.9}
-          size={small}
-          sizeAttenuation
-          depthWrite={false}
-          blending={THREE.AdditiveBlending}
-          toneMapped={false}
-        />
+        <pointsMaterial map={starTex} vertexColors transparent opacity={0.9} size={small} sizeAttenuation depthWrite={false} blending={THREE.AdditiveBlending} toneMapped={false} />
       </points>
       <points geometry={geoMed} frustumCulled={false}>
-        <pointsMaterial
-          map={starTex}
-          vertexColors
-          transparent
-          opacity={0.95}
-          size={medium}
-          sizeAttenuation
-          depthWrite={false}
-          blending={THREE.AdditiveBlending}
-          toneMapped={false}
-        />
+        <pointsMaterial map={starTex} vertexColors transparent opacity={0.95} size={medium} sizeAttenuation depthWrite={false} blending={THREE.AdditiveBlending} toneMapped={false} />
       </points>
       <points geometry={geoLarge} frustumCulled={false}>
-        <pointsMaterial
-          map={starTex}
-          vertexColors
-          transparent
-          opacity={1.0}
-          size={large}
-          sizeAttenuation
-          depthWrite={false}
-          blending={THREE.AdditiveBlending}
-          toneMapped={false}
-        />
+        <pointsMaterial map={starTex} vertexColors transparent opacity={1.0} size={large} sizeAttenuation depthWrite={false} blending={THREE.AdditiveBlending} toneMapped={false} />
       </points>
     </group>
   )
 }
 
 function App() {
-  const [glowSelection, setGlowSelection] = useState([])
-
   return (
     <div style={{ width: '100vw', height: '100vh', background: '#000' }}>
       <Canvas
@@ -529,50 +594,10 @@ function App() {
       >
         <color attach="background" args={['#000']} />
         <fogExp2 attach="fog" args={['#0a1028', 0.012]} />
-
-        <ParallaxRig yaw={0.045} pitch={0.03} pos={0.07} ease={7.8} deadzone={0.012} mobileScale={0.6}>
-          <ColoredStars count={1200} radius={120} depth={40} />
-          <StarFlares count={100} radius={115} minIdle={1.0} maxIdle={3.0} minDur={1.6} maxDur={2.6} />
-          <NebulaFog color="#0c1840" opacity={0.05} scale={200} />
-
-          <spotLight
-            castShadow
-            color="#ffffff"
-            intensity={1.35}
-            angle={0.55}
-            penumbra={0.9}
-            position={[6, 6, 6]}
-            distance={35}
-            shadow-bias={-0.00025}
-            shadow-normalBias={0.03}
-            shadow-mapSize-width={2048}
-            shadow-mapSize-height={2048}
-          />
-          <directionalLight color="#9ec2ff" intensity={1.65} position={[-6, 3, 4]} />
-          <directionalLight color="#9ec2ff" intensity={1.65} position={[-6, 3, -4]} />
-          <directionalLight color="#9ec2ff" intensity={3.65} position={[6, 3, -4]} />
-          <ambientLight intensity={5.0} />
-          <hemisphereLight intensity={1.12} color="#dfe7ff" groundColor="#0b0b10" />
-
-          <Suspense fallback={null}>
-            <Environment preset="night" background={false} blur={0.2} />
-            <SpaceStation scale={0.6} onGlowTargets={setGlowSelection} />
-          </Suspense>
-        </ParallaxRig>
-
-        <EffectComposer disableNormalPass>
-          <SelectiveBloom
-            selection={glowSelection}
-            intensity={2.5}
-            radius={0.75}
-            luminanceThreshold={0}
-            luminanceSmoothing={0}
-            mipmapBlur
-          />
-          <Vignette eskil offset={0.18} darkness={0.58} />
-        </EffectComposer>
+        <Suspense fallback={null}>
+          <SceneContent />
+        </Suspense>
       </Canvas>
-
       <DreiLoader />
     </div>
   )
