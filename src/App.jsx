@@ -10,6 +10,10 @@ import { EffectComposer, SelectiveBloom, Vignette } from '@react-three/postproce
 import * as THREE from 'three'
 import './App.css'
 
+// Only draw intro wireframe for these mesh/group names
+//const WIREFRAME_TARGETS = ['Object_6', 'Object_18', 'Object_38', 'Object_20']
+const WIREFRAME_TARGETS = ['Object_6', 'Object_20', 'Object_32']
+
 // Easy knobs for DARK matte look
 const DARK_MATTE = {
   metalness: 0.05,
@@ -18,15 +22,20 @@ const DARK_MATTE = {
   darkenFactor: 0.85
 }
 
-// Injects a "splash" reveal shader into a material
+// Identify particle materials by name
+function isParticleMaterialName(name) {
+  if (!name) return false
+  const n = name.toLowerCase()
+  return n === 'emission' || n.includes('emiss') || n.includes('particle') || n.includes('fx') || n.includes('glow')
+}
+
+// Injects a "splash" reveal shader into a material (meshes) - uses uSplashProgress
 function injectSplashShader(mat, introUniforms) {
   mat.onBeforeCompile = (shader) => {
-    // Pass our custom uniforms to the shader
-    shader.uniforms.uIntroProgress = introUniforms.uIntroProgress
+    shader.uniforms.uSplashProgress = introUniforms.uSplashProgress
     shader.uniforms.uIntroStartPoint = introUniforms.uIntroStartPoint
     shader.uniforms.uTime = introUniforms.uTime
 
-    // Add uniforms to the GLSL code
     shader.vertexShader = `
       varying vec3 vWorldPosition;
       ${shader.vertexShader}
@@ -37,7 +46,7 @@ function injectSplashShader(mat, introUniforms) {
     )
     
     shader.fragmentShader = `
-      uniform float uIntroProgress;
+      uniform float uSplashProgress;
       uniform vec3 uIntroStartPoint;
       uniform float uTime;
       varying vec3 vWorldPosition;
@@ -46,8 +55,12 @@ function injectSplashShader(mat, introUniforms) {
       `#include <dithering_fragment>`,
       `#include <dithering_fragment>
       
+      // Mesh reveal happens as uSplashProgress goes from 0.0 to 1.0.
+      // If uSplashProgress starts at -1, smoothstep clamps to 0 until progress > 0.
+      float modelRevealProgress = smoothstep(0.0, 1.0, uSplashProgress);
+
       float dist = distance(vWorldPosition, uIntroStartPoint);
-      float revealRadius = uIntroProgress * 15.0; // Max radius of reveal
+      float revealRadius = modelRevealProgress * 15.0; // Increase for faster spatial sweep
       float edgeWidth = 2.0;
 
       // Ripple effect for the edge
@@ -69,13 +82,6 @@ function injectSplashShader(mat, introUniforms) {
       `
     )
   }
-}
-
-// Identify particle materials by name
-function isParticleMaterialName(name) {
-  if (!name) return false
-  const n = name.toLowerCase()
-  return n === 'emission' || n.includes('emiss') || n.includes('particle') || n.includes('fx') || n.includes('glow')
 }
 
 // Merged material properties for desired lighting with intro animation compatibility
@@ -115,7 +121,7 @@ function tuneDarkMatte(root, onGlowTargets, introUniforms) {
           mat.emissiveIntensity = 4.8
         }
         mat.toneMapped = false
-        mat.transparent = true // Kept for intro animation
+        mat.transparent = true // for intro animation
         mat.depthWrite = true
         mat.depthTest = true
         mat.blending = THREE.NormalBlending
@@ -139,12 +145,12 @@ function tuneDarkMatte(root, onGlowTargets, introUniforms) {
         if (mat.color) mat.color.multiplyScalar(DARK_MATTE.darkenFactor)
 
         mat.toneMapped = true
-        mat.transparent = true // Kept for intro animation
+        mat.transparent = true // for intro animation
         mat.blending = THREE.NormalBlending
         mat.side = THREE.FrontSide
       }
 
-      // Inject the splash shader into every material
+      // Inject the splash shader into every material (uses uSplashProgress)
       injectSplashShader(mat, introUniforms)
 
       mat.needsUpdate = true
@@ -196,41 +202,131 @@ function makePerfectLoopClip(src) {
   return clip
 }
 
-// --- **UPDATED** INTRO WIREFRAME COMPONENT ---
-function IntroWireframe({ scene, scale }) {
-  const wireframes = useMemo(() => {
-    const wires = []
-    scene.traverse((child) => {
-      // **FIX APPLIED HERE**: Check if the child is a mesh AND its name is NOT 'light_0'
-      if (child.isMesh && child.name !== 'light_0') {
-        const edges = new THREE.EdgesGeometry(child.geometry, 30)
-        const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
-            color: '#ffffff',
-            transparent: true,
-            opacity: 0.75,
-            polygonOffset: true,
-            polygonOffsetFactor: -1,
-            polygonOffsetUnits: -1,
-        }))
-        line.position.copy(child.position)
-        line.rotation.copy(child.rotation)
-        line.scale.copy(child.scale)
-        wires.push(line)
-      }
-    })
-    return wires
-  }, [scene])
+/**
+ * Add wireframes that "splash in" and then "splash out".
+ * This version uses uWireProgress so it can have an independent speed.
+ */
+function addWireframesToTargets(
+  scene,
+  targets,
+  introUniforms,
+  { color = '#dbe7ff', opacity = 0.6, threshold = 30, depthTest = true } = {}
+) {
+  const lines = []
+  const normalize = (n) => String(n || '').toLowerCase().replace(/\.\d+$/, '') // strip .001 suffix
+  const normalizedTargets = [...new Set((targets || []).map(normalize))]
 
-  return (
-    <group scale={scale}>
-      {wireframes.map((wire, i) => (
-        <primitive key={i} object={wire} />
-      ))}
-    </group>
-  )
+  const nameMatches = (nodeName) => {
+    const name = normalize(nodeName)
+    return normalizedTargets.some((t) =>
+      name === t ||
+      name.startsWith(`${t}_`) ||
+      name.startsWith(`${t}.`) ||
+      name.startsWith(`${t}-`) ||
+      name.startsWith(`${t} `)
+    )
+  }
+
+  const matchesNodeOrAncestors = (node) => {
+    let cur = node
+    while (cur) {
+      if (nameMatches(cur.name)) return true
+      cur = cur.parent
+    }
+    return false
+  }
+
+  scene.traverse((child) => {
+    if (!child.isMesh) return
+    if (!matchesNodeOrAncestors(child)) return
+
+    const edges = new THREE.EdgesGeometry(child.geometry, threshold)
+    const mat = new THREE.LineBasicMaterial({
+      color,
+      transparent: true,
+      opacity,
+      toneMapped: true,
+      depthTest,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1
+    })
+
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uWireProgress = introUniforms.uWireProgress
+      shader.uniforms.uIntroStartPoint = introUniforms.uIntroStartPoint
+      shader.uniforms.uTime = introUniforms.uTime
+
+      shader.vertexShader = shader.vertexShader
+        .replace(
+          'void main() {',
+          `varying vec3 vWorldPosition;
+           void main() {`
+        )
+        .replace(
+          'gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );',
+          `vWorldPosition = (modelMatrix * vec4( position, 1.0 )).xyz;
+           gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );`
+        )
+
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          'void main() {',
+          `uniform float uWireProgress;
+           uniform vec3 uIntroStartPoint;
+           uniform float uTime;
+           varying vec3 vWorldPosition;
+           void main() {`
+        )
+        .replace(
+          /\}\s*$/,
+          `
+            float distWF = distance(vWorldPosition, uIntroStartPoint);
+            float edgeWidthWF = 3.0; // Smoother fade thickness
+
+            // Phase 1: Wireframe "splashes in" [-1..0]
+            float revealProgress = smoothstep(-1.0, 0.0, uWireProgress);
+            float revealRadius = revealProgress * 15.0;
+
+            // Phase 2: Wireframe "splashes out" [0..1]
+            float fadeProgress = smoothstep(0.0, 1.0, uWireProgress);
+            float fadeRadius = fadeProgress * 15.0;
+
+            float fadeInAlpha  = 1.0 - smoothstep(revealRadius - edgeWidthWF, revealRadius, distWF);
+            float fadeOutAlpha = smoothstep(fadeRadius - edgeWidthWF, fadeRadius, distWF);
+
+            float finalAlpha = min(fadeInAlpha, fadeOutAlpha);
+
+            // Subtle ripple
+            float ripple = 0.97 + 0.03 * sin(distWF * 2.0 - uTime * 4.0);
+
+            gl_FragColor.a *= finalAlpha * ripple;
+            if (gl_FragColor.a < 0.01) discard;
+          }`
+        )
+    }
+
+    const line = new THREE.LineSegments(edges, mat)
+    line.renderOrder = 1000
+    line.frustumCulled = false
+
+    child.add(line)
+    lines.push(line)
+  })
+
+  const cleanup = () => {
+    lines.forEach((line) => {
+      line.parent?.remove(line)
+      line.geometry?.dispose?.()
+      line.material?.dispose?.()
+    })
+  }
+
+  return { lines, cleanup }
 }
 
-function SpaceStation({ scale = 0.6, onGlowTargets, introUniforms }) {
+function SpaceStation({ scale = 0.6, onGlowTargets, introUniforms, showWireframe = true, wireframeTargets = WIREFRAME_TARGETS }) {
   const group = useRef()
   const gltf = useGLTF('/models/space_station_4.glb')
   const { scene, animations } = gltf
@@ -239,6 +335,7 @@ function SpaceStation({ scale = 0.6, onGlowTargets, introUniforms }) {
   const actionRef = useRef(null)
   const hoveredRef = useRef(false)
   const transitionRef = useRef({ progress: 0, from: 0.5, to: 0.5 })
+  const wireRef = useRef({ lines: [], cleanup: null })
 
   const FORWARD_SPEED = 0.5
   const REVERSE_SPEED = -0.35
@@ -274,6 +371,33 @@ function SpaceStation({ scale = 0.6, onGlowTargets, introUniforms }) {
     }
   }, [actions, clipToPlay, clips, mixer, onGlowTargets, scene, group, introUniforms])
 
+  // Attach/detach intro wireframes on the actual rendered scene
+  useEffect(() => {
+    if (showWireframe && scene && !wireRef.current.cleanup) {
+      wireRef.current = addWireframesToTargets(
+        scene,
+        wireframeTargets,
+        introUniforms,
+        {
+          color: '#dbe7ff',
+          opacity: 0.6,
+          threshold: 30,
+          depthTest: true
+        }
+      )
+    }
+    if (!showWireframe && wireRef.current.cleanup) {
+      wireRef.current.cleanup()
+      wireRef.current = { lines: [], cleanup: null }
+    }
+    return () => {
+      if (wireRef.current.cleanup) {
+        wireRef.current.cleanup()
+        wireRef.current = { lines: [], cleanup: null }
+      }
+    }
+  }, [scene, showWireframe, wireframeTargets, introUniforms])
+
   const handleOver = (e) => {
     e.stopPropagation()
     if (hoveredRef.current) return
@@ -293,20 +417,28 @@ function SpaceStation({ scale = 0.6, onGlowTargets, introUniforms }) {
   }
 
   useFrame((_, dt) => {
+    // Animation speed easing
     const act = actionRef.current
-    if (!act) return
+    if (act) {
+      const trans = transitionRef.current
+      const target = hoveredRef.current ? REVERSE_SPEED : FORWARD_SPEED
+      const duration = hoveredRef.current ? BRAKE_DURATION : ACCEL_DURATION
 
-    const trans = transitionRef.current
-    const target = hoveredRef.current ? REVERSE_SPEED : FORWARD_SPEED
-    const duration = hoveredRef.current ? BRAKE_DURATION : ACCEL_DURATION
+      if (trans.progress < 1) {
+        trans.progress = Math.min(1, trans.progress + dt / duration)
+        const t = hoveredRef.current ? easeOutExpo(trans.progress) : easeInOutCubic(trans.progress)
+        const speed = trans.from + (trans.to - trans.from) * t
+        act.timeScale = Math.abs(speed) < 0.005 ? 0 : speed
+      } else {
+        act.timeScale = Math.abs(target) < 0.005 ? 0 : target
+      }
+    }
 
-    if (trans.progress < 1) {
-      trans.progress = Math.min(1, trans.progress + dt / duration)
-      const t = hoveredRef.current ? easeOutExpo(trans.progress) : easeInOutCubic(trans.progress)
-      const speed = trans.from + (trans.to - trans.from) * t
-      act.timeScale = Math.abs(speed) < 0.005 ? 0 : speed
-    } else {
-      act.timeScale = Math.abs(target) < 0.005 ? 0 : target
+    // Optional: hard cleanup when wireframe fully revealed/finished
+    const pWire = introUniforms?.uWireProgress?.value ?? 0
+    if (pWire >= 0.999 && wireRef.current.cleanup) {
+      wireRef.current.cleanup()
+      wireRef.current = { lines: [], cleanup: null }
     }
   })
 
@@ -325,34 +457,59 @@ function SpaceStation({ scale = 0.6, onGlowTargets, introUniforms }) {
 function SceneContent() {
   const [glowSelection, setGlowSelection] = useState([])
   const [introFinished, setIntroFinished] = useState(false)
-  
-  const introProgressRef = useRef({ value: 0 })
-  
+
+  // Independent timelines: wireframe and splash/mesh
+  const wireProgressRef = useRef({ value: -1 })
+  const splashProgressRef = useRef({ value: -1 })
+
+  // Tweak these to control start times and durations
+  const WIRE_DELAY_MS = 2500
+  const SPLASH_DELAY_MS = 500
+  // Duration for each to go from -1 → +1 (two units total)
+  const WIRE_TOTAL_SECONDS = 3.5
+  const SPLASH_TOTAL_SECONDS = 6
+
+  // Optional: control spatial sweep speed (the radius factor in shaders)
+  // Increase for faster spatial expansion, decrease for slower
+  // You can also expose these as uniforms if you want to tweak live.
+  // Currently hard-coded in shaders as 15.0.
+
   const introUniforms = useMemo(() => ({
-    uIntroProgress: introProgressRef.current,
+    uWireProgress: wireProgressRef.current,
+    uSplashProgress: splashProgressRef.current,
     uIntroStartPoint: { value: new THREE.Vector3(0, 0, 0) },
     uTime: { value: 0 },
   }), [])
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      introProgressRef.current.isAnimating = true
-    }, 1500)
-    return () => clearTimeout(timer)
+    const t1 = setTimeout(() => {
+      wireProgressRef.current.isAnimating = true
+    }, WIRE_DELAY_MS)
+    const t2 = setTimeout(() => {
+      splashProgressRef.current.isAnimating = true
+    }, SPLASH_DELAY_MS)
+    return () => { clearTimeout(t1); clearTimeout(t2) }
   }, [])
-  
+
   useFrame((state, dt) => {
     introUniforms.uTime.value = state.clock.elapsedTime
-    if (introProgressRef.current.isAnimating && introProgressRef.current.value < 1) {
-      introProgressRef.current.value += dt / 2.5 // Animation duration
-      introProgressRef.current.value = Math.min(introProgressRef.current.value, 1)
-      if (introProgressRef.current.value >= 1) {
-        setIntroFinished(true)
+
+    const advance = (ref, totalSeconds) => {
+      // Move -1 → +1 over totalSeconds (2 units / second)
+      if (ref.current.isAnimating && ref.current.value < 1) {
+        const unitsPerSecond = 2 / totalSeconds
+        ref.current.value = Math.min(1, ref.current.value + unitsPerSecond * dt)
       }
     }
-  })
 
-  const gltf = useGLTF('/models/space_station_4.glb')
+    advance(wireProgressRef, WIRE_TOTAL_SECONDS)
+    advance(splashProgressRef, SPLASH_TOTAL_SECONDS)
+
+    // Hide wireframe overlay when it's done
+    if (!introFinished && wireProgressRef.current.value >= 1) {
+      setIntroFinished(true)
+    }
+  })
 
   return (
     <>
@@ -370,13 +527,19 @@ function SceneContent() {
 
         <Suspense fallback={null}>
           <Environment preset="night" background={false} blur={0.2} />
-          {!introFinished && <IntroWireframe scene={gltf.scene} scale={0.6} />}
-          <SpaceStation scale={0.6} onGlowTargets={setGlowSelection} introUniforms={introUniforms} />
+          <SpaceStation
+            scale={0.6}
+            onGlowTargets={setGlowSelection}
+            introUniforms={introUniforms}
+            showWireframe={!introFinished}
+            wireframeTargets={WIREFRAME_TARGETS}
+          />
         </Suspense>
       </ParallaxRig>
 
       <EffectComposer disableNormalPass>
-        <SelectiveBloom selection={glowSelection} intensity={2.5} radius={0.75} luminanceThreshold={0} luminanceSmoothing={0} mipmapBlur />
+        {/* CHANGED: raise threshold so faint wireframe lines don't bloom */}
+        <SelectiveBloom selection={glowSelection} intensity={0.5} radius={0.75} luminanceThreshold={0.7} luminanceSmoothing={0} mipmapBlur />
         <Vignette eskil offset={0.18} darkness={0.58} />
       </EffectComposer>
     </>
@@ -502,7 +665,7 @@ function ColoredStars({ count = 1200, radius = 120, depth = 40, small=0.65, medi
     grd.addColorStop(0.35, 'rgba(255,255,255,0.7)')
     grd.addColorStop(1.0, 'rgba(0,0,0,0)')
     ctx.fillStyle = grd
-    ctx.fillRect(0, 0, size, size)
+    ctx.fillRect(0, 0, size, 0 + size)
     const tex = new THREE.CanvasTexture(c)
     tex.colorSpace = THREE.SRGBColorSpace
     tex.anisotropy = 4
