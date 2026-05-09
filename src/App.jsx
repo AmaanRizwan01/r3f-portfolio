@@ -10,26 +10,46 @@ import { EffectComposer, SelectiveBloom, Vignette } from '@react-three/postproce
 import * as THREE from 'three'
 import './App.css'
 
-// Only draw intro wireframe for these mesh/group names
-//const WIREFRAME_TARGETS = ['Object_6', 'Object_18', 'Object_38', 'Object_20']
+// Edit these names to choose which meshes/groups get a temporary wireframe overlay (case-insensitive; suffix-insensitive)
 const WIREFRAME_TARGETS = ['Object_6', 'Object_20', 'Object_32']
 
-// Easy knobs for DARK matte look
+// Glow target meshes for the "engines"
+const ENGINE_GLOW_TARGETS = ['Object_32', 'Object_40', 'Object_42']
+
+// Magenta engine emissive + subtle pulse
+const ENGINE_GLOW = {
+  color: '#ff40c0',
+  baseIntensity: 2.2,   // steady brightness
+  pulseIntensity: 1.0,  // subtle pulse
+  pulseSpeed: 2.2       // slightly slower
+}
+
+// Real magenta light, subtle pulse
+const ENGINE_LIGHT = {
+  color: '#ff40c0',
+  intensityBase: 35,    // steady cast light (physicallyCorrectLights on)
+  intensityPulse: 20,   // subtle pulse
+  distance: 9,
+  decay: 2,
+  castShadow: false
+}
+
+// Tweak these to change the dark matte look on non-emissive materials
 const DARK_MATTE = {
-  metalness: 0.05,
-  roughness: 0.95,
+  metalness: 0.1,
+  roughness: 0.85,
   envMapIntensity: 0.08,
   darkenFactor: 0.85
 }
 
-// Identify particle materials by name
+// Extend these checks to match your emissive/FX material naming
 function isParticleMaterialName(name) {
   if (!name) return false
   const n = name.toLowerCase()
   return n === 'emission' || n.includes('emiss') || n.includes('particle') || n.includes('fx') || n.includes('glow')
 }
 
-// Injects a "splash" reveal shader into a material (meshes) - uses uSplashProgress
+// Mesh splash reveal (uSplashProgress 0→1 drives a radial sweep); increase 15.0 below for faster sweep
 function injectSplashShader(mat, introUniforms) {
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uSplashProgress = introUniforms.uSplashProgress
@@ -54,39 +74,27 @@ function injectSplashShader(mat, introUniforms) {
     `.replace(
       `#include <dithering_fragment>`,
       `#include <dithering_fragment>
-      
-      // Mesh reveal happens as uSplashProgress goes from 0.0 to 1.0.
-      // If uSplashProgress starts at -1, smoothstep clamps to 0 until progress > 0.
       float modelRevealProgress = smoothstep(0.0, 1.0, uSplashProgress);
-
       float dist = distance(vWorldPosition, uIntroStartPoint);
-      float revealRadius = modelRevealProgress * 15.0; // Increase for faster spatial sweep
-      float edgeWidth = 2.0;
-
-      // Ripple effect for the edge
+      float revealRadius = modelRevealProgress * 15.0; // change to speed up/slow down the mesh sweep
+      float edgeWidth = 2.0;                           // change to soften/harden the edge
       float ripple = sin(dist * 2.0 - uTime * 4.0) * 0.5 + 0.5;
-      
       float op = smoothstep(revealRadius - edgeWidth, revealRadius, dist);
       float finalOpacity = mix(1.0, 0.0, op);
-      
-      // Add ripple only at the edge
-      if (dist > revealRadius - edgeWidth && dist < revealRadius) {
-        finalOpacity *= ripple;
-      }
-      
-      if (finalOpacity < 0.01) {
-        discard;
-      }
-
+      if (finalOpacity < 0.01) discard;
       gl_FragColor = vec4(gl_FragColor.rgb, gl_FragColor.a * finalOpacity);
       `
     )
   }
 }
 
-// Merged material properties for desired lighting with intro animation compatibility
+// Applies the matte look, disables embedded lights, and injects the splash reveal into all materials
 function tuneDarkMatte(root, onGlowTargets, introUniforms) {
-  const glow = []
+  const animatedGlowMaterials = []
+  const engineNodes = []
+  const particleNodes = []
+  const glowTargets = []
+
   root.traverse((child) => {
     if (child.isLight) {
       child.visible = false
@@ -102,7 +110,9 @@ function tuneDarkMatte(root, onGlowTargets, introUniforms) {
       child.geometry.setAttribute('uv2', child.geometry.attributes.uv.clone())
     }
 
+    const isEnginePart = ENGINE_GLOW_TARGETS.includes(child.name)
     const mats = Array.isArray(child.material) ? child.material : [child.material]
+
     mats.forEach((mat) => {
       if (!mat) return
 
@@ -114,14 +124,27 @@ function tuneDarkMatte(root, onGlowTargets, introUniforms) {
 
       const isParticle = isParticleMaterialName(mat.name)
 
-      if (isParticle) {
+      if (isEnginePart) {
+        // Engines: emissive + included in bloom selection
+        mat.emissive = new THREE.Color(ENGINE_GLOW.color)
+        mat.emissiveIntensity = ENGINE_GLOW.baseIntensity
+        mat.toneMapped = false
+        mat.transparent = true
+        mat.blending = THREE.NormalBlending
+        child.renderOrder = Math.max(child.renderOrder || 0, 3)
+
+        animatedGlowMaterials.push(mat)
+        if (!engineNodes.includes(child)) engineNodes.push(child)
+        glowTargets.push(child)
+      } else if (isParticle) {
+        // PARTICLES BLOOM: emissive + added to bloom selection (restored)
         if ('emissive' in mat) {
           const isBlack = !mat.emissive || (mat.emissive.r === 0 && mat.emissive.g === 0 && mat.emissive.b === 0)
           if (isBlack) mat.emissive = new THREE.Color('#88e8ff')
           mat.emissiveIntensity = 4.8
         }
         mat.toneMapped = false
-        mat.transparent = true // for intro animation
+        mat.transparent = true
         mat.depthWrite = true
         mat.depthTest = true
         mat.blending = THREE.NormalBlending
@@ -129,9 +152,10 @@ function tuneDarkMatte(root, onGlowTargets, introUniforms) {
         mat.polygonOffset = true
         mat.polygonOffsetFactor = 1
         mat.polygonOffsetUnits = 1
-        
-        glow.push(child)
         child.renderOrder = Math.max(child.renderOrder || 0, 2)
+
+        particleNodes.push(child)
+        glowTargets.push(child)
       } else {
         if ('metalness' in mat) mat.metalness = DARK_MATTE.metalness
         if ('roughness' in mat) mat.roughness = DARK_MATTE.roughness
@@ -141,26 +165,26 @@ function tuneDarkMatte(root, onGlowTargets, introUniforms) {
         if ('clearcoat' in mat) { mat.clearcoat = 0; mat.clearcoatRoughness = 1 }
         if ('sheen' in mat) mat.sheen = 0
         if ('emissiveIntensity' in mat) mat.emissiveIntensity = 0
-        
         if (mat.color) mat.color.multiplyScalar(DARK_MATTE.darkenFactor)
-
         mat.toneMapped = true
-        mat.transparent = true // for intro animation
+        mat.transparent = true
         mat.blending = THREE.NormalBlending
         mat.side = THREE.FrontSide
       }
 
-      // Inject the splash shader into every material (uses uSplashProgress)
       injectSplashShader(mat, introUniforms)
-
       mat.needsUpdate = true
     })
   })
-  onGlowTargets?.(glow)
+
+  // IMPORTANT: Pass engines + particles to bloom selection
+  onGlowTargets?.(glowTargets)
+  return { animatedGlowMaterials, engineNodes, particleNodes }
 }
 
-const easeOutExpo   = (t) => (t === 1 ? 1 : 1 - Math.pow(2, -10 * t))
-const easeInOutCubic= (t) => (t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2)
+const easeOutExpo    = (t) => (t === 1 ? 1 : 1 - Math.pow(2, -10 * t))
+const easeInOutCubic = (t) => (t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2)
+const easeInOutQuint = (t) => (t < 0.5 ? 16 * t * t * t * t * t : 1 - Math.pow(-2 * t + 2, 5) / 2)
 
 function makePerfectLoopClip(src) {
   const clip = src.clone()
@@ -175,22 +199,14 @@ function makePerfectLoopClip(src) {
     const hasEndKey = Math.abs(times[times.length - 1] - dur) < 1e-6
     const firstVal = values.slice(0, stride)
 
-    if (!hasEndKey) {
-      times.push(dur)
-      values.push(...firstVal)
-    } else {
-      for (let i = 0; i < stride; i++) {
-        values[values.length - stride + i] = firstVal[i]
-      }
-    }
+    if (!hasEndKey) { times.push(dur); values.push(...firstVal) }
+    else { for (let i = 0; i < stride; i++) values[values.length - stride + i] = firstVal[i] }
 
     if (/quaternion/i.test(track.constructor.name) || track.name.endsWith('.quaternion')) {
       const q0 = new THREE.Quaternion(firstVal[0], firstVal[1], firstVal[2], firstVal[3]).normalize()
       const li = values.length - stride
       const qL = new THREE.Quaternion(values[li], values[li+1], values[li+2], values[li+3]).normalize()
-      if (q0.dot(qL) < 0) {
-        values[li]   = -qL.x; values[li+1] = -qL.y; values[li+2] = -qL.z; values[li+3] = -qL.w
-      }
+      if (q0.dot(qL) < 0) { values[li] = -qL.x; values[li+1] = -qL.y; values[li+2] = -qL.z; values[li+3] = -qL.w }
     }
 
     const Typed = track.constructor
@@ -202,10 +218,7 @@ function makePerfectLoopClip(src) {
   return clip
 }
 
-/**
- * Add wireframes that "splash in" and then "splash out".
- * This version uses uWireProgress so it can have an independent speed.
- */
+// Wireframe overlay: reveal in [-1..0], fade out in [0..1].
 function addWireframesToTargets(
   scene,
   targets,
@@ -213,26 +226,19 @@ function addWireframesToTargets(
   { color = '#dbe7ff', opacity = 0.6, threshold = 30, depthTest = true } = {}
 ) {
   const lines = []
-  const normalize = (n) => String(n || '').toLowerCase().replace(/\.\d+$/, '') // strip .001 suffix
+  const normalize = (n) => String(n || '').toLowerCase().replace(/\.\d+$/, '')
   const normalizedTargets = [...new Set((targets || []).map(normalize))]
 
   const nameMatches = (nodeName) => {
     const name = normalize(nodeName)
     return normalizedTargets.some((t) =>
-      name === t ||
-      name.startsWith(`${t}_`) ||
-      name.startsWith(`${t}.`) ||
-      name.startsWith(`${t}-`) ||
-      name.startsWith(`${t} `)
+      name === t || name.startsWith(`${t}_`) || name.startsWith(`${t}.`) || name.startsWith(`${t}-`) || name.startsWith(`${t} `)
     )
   }
 
   const matchesNodeOrAncestors = (node) => {
     let cur = node
-    while (cur) {
-      if (nameMatches(cur.name)) return true
-      cur = cur.parent
-    }
+    while (cur) { if (nameMatches(cur.name)) return true; cur = cur.parent }
     return false
   }
 
@@ -259,11 +265,7 @@ function addWireframesToTargets(
       shader.uniforms.uTime = introUniforms.uTime
 
       shader.vertexShader = shader.vertexShader
-        .replace(
-          'void main() {',
-          `varying vec3 vWorldPosition;
-           void main() {`
-        )
+        .replace('void main() {', `varying vec3 vWorldPosition; void main() {`)
         .replace(
           'gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );',
           `vWorldPosition = (modelMatrix * vec4( position, 1.0 )).xyz;
@@ -283,24 +285,19 @@ function addWireframesToTargets(
           /\}\s*$/,
           `
             float distWF = distance(vWorldPosition, uIntroStartPoint);
-            float edgeWidthWF = 3.0; // Smoother fade thickness
+            float edgeWidthWF = 3.0;
 
-            // Phase 1: Wireframe "splashes in" [-1..0]
             float revealProgress = smoothstep(-1.0, 0.0, uWireProgress);
             float revealRadius = revealProgress * 15.0;
 
-            // Phase 2: Wireframe "splashes out" [0..1]
             float fadeProgress = smoothstep(0.0, 1.0, uWireProgress);
             float fadeRadius = fadeProgress * 15.0;
 
             float fadeInAlpha  = 1.0 - smoothstep(revealRadius - edgeWidthWF, revealRadius, distWF);
             float fadeOutAlpha = smoothstep(fadeRadius - edgeWidthWF, fadeRadius, distWF);
-
             float finalAlpha = min(fadeInAlpha, fadeOutAlpha);
 
-            // Subtle ripple
             float ripple = 0.97 + 0.03 * sin(distWF * 2.0 - uTime * 4.0);
-
             gl_FragColor.a *= finalAlpha * ripple;
             if (gl_FragColor.a < 0.01) discard;
           }`
@@ -310,7 +307,6 @@ function addWireframesToTargets(
     const line = new THREE.LineSegments(edges, mat)
     line.renderOrder = 1000
     line.frustumCulled = false
-
     child.add(line)
     lines.push(line)
   })
@@ -332,14 +328,15 @@ function SpaceStation({ scale = 0.6, onGlowTargets, introUniforms, showWireframe
   const { scene, animations } = gltf
   const { actions, names, clips, mixer } = useAnimations(animations, group)
 
+  const animatedEngineMats = useRef([])
+  const engineLightsRef = useRef([])
   const actionRef = useRef(null)
   const hoveredRef = useRef(false)
   const transitionRef = useRef({ progress: 0, from: 0.5, to: 0.5 })
-  const wireRef = useRef({ lines: [], cleanup: null })
 
   const FORWARD_SPEED = 0.5
-  const REVERSE_SPEED = -0.35
-  const BRAKE_DURATION = 5.8
+  const REVERSE_SPEED = -0.25
+  const BRAKE_DURATION = 4.8
   const ACCEL_DURATION = 4.0
 
   const clipToPlay = useMemo(() => {
@@ -348,43 +345,61 @@ function SpaceStation({ scale = 0.6, onGlowTargets, introUniforms, showWireframe
   }, [names, clips])
 
   useEffect(() => {
-    tuneDarkMatte(scene, onGlowTargets, introUniforms)
-    Object.values(actions).forEach((a) => a?.stop())
+    const { animatedGlowMaterials, engineNodes } = tuneDarkMatte(scene, onGlowTargets, introUniforms)
+    animatedEngineMats.current = animatedGlowMaterials
 
+    // Remove old lights (safety for hot reload)
+    engineLightsRef.current.forEach((l) => l.parent?.remove(l))
+    engineLightsRef.current = []
+
+    // Attach real lights to engine nodes
+    engineLightsRef.current = engineNodes.map((node) => {
+      const light = new THREE.PointLight(
+        ENGINE_LIGHT.color,
+        ENGINE_LIGHT.intensityBase,
+        ENGINE_LIGHT.distance,
+        ENGINE_LIGHT.decay
+      )
+      light.castShadow = ENGINE_LIGHT.castShadow
+      node.add(light)
+      return light
+    })
+
+    Object.values(actions).forEach((a) => a?.stop?.())
+    let cleanupAnim = () => {}
     if (clipToPlay) {
       const src = clips.find((c) => c.name === clipToPlay)
       const clip = src ? makePerfectLoopClip(src) : null
       const act = clip ? mixer.clipAction(clip, group.current) : actions[clipToPlay]
-
       if (act) {
         act.reset().setLoop(THREE.LoopRepeat, Infinity).play()
         act.clampWhenFinished = false
         act.timeScale = FORWARD_SPEED
         actionRef.current = act
         transitionRef.current = { progress: 1, from: FORWARD_SPEED, to: FORWARD_SPEED }
-
-        return () => {
+        cleanupAnim = () => {
           act.stop()
           if (clip) mixer.uncacheClip(clip)
         }
       }
     }
+
+    return () => {
+      cleanupAnim()
+      engineLightsRef.current.forEach((l) => l.parent?.remove(l))
+      engineLightsRef.current = []
+    }
   }, [actions, clipToPlay, clips, mixer, onGlowTargets, scene, group, introUniforms])
 
-  // Attach/detach intro wireframes on the actual rendered scene
+  const wireRef = useRef({ lines: [], cleanup: null })
   useEffect(() => {
     if (showWireframe && scene && !wireRef.current.cleanup) {
-      wireRef.current = addWireframesToTargets(
-        scene,
-        wireframeTargets,
-        introUniforms,
-        {
-          color: '#dbe7ff',
-          opacity: 0.6,
-          threshold: 30,
-          depthTest: true
-        }
-      )
+      wireRef.current = addWireframesToTargets(scene, wireframeTargets, introUniforms, {
+        color: '#dbe7ff',
+        opacity: 0.6,
+        threshold: 30,
+        depthTest: true
+      })
     }
     if (!showWireframe && wireRef.current.cleanup) {
       wireRef.current.cleanup()
@@ -406,7 +421,6 @@ function SpaceStation({ scale = 0.6, onGlowTargets, introUniforms, showWireframe
     const current = actionRef.current?.timeScale ?? FORWARD_SPEED
     transitionRef.current = { progress: 0, from: current, to: REVERSE_SPEED }
   }
-
   const handleOut = (e) => {
     e.stopPropagation()
     if (!hoveredRef.current) return
@@ -416,14 +430,13 @@ function SpaceStation({ scale = 0.6, onGlowTargets, introUniforms, showWireframe
     transitionRef.current = { progress: 0, from: current, to: FORWARD_SPEED }
   }
 
-  useFrame((_, dt) => {
-    // Animation speed easing
+  useFrame((state, dt) => {
+    // Animate model speed on hover
     const act = actionRef.current
     if (act) {
       const trans = transitionRef.current
       const target = hoveredRef.current ? REVERSE_SPEED : FORWARD_SPEED
       const duration = hoveredRef.current ? BRAKE_DURATION : ACCEL_DURATION
-
       if (trans.progress < 1) {
         trans.progress = Math.min(1, trans.progress + dt / duration)
         const t = hoveredRef.current ? easeOutExpo(trans.progress) : easeInOutCubic(trans.progress)
@@ -434,7 +447,15 @@ function SpaceStation({ scale = 0.6, onGlowTargets, introUniforms, showWireframe
       }
     }
 
-    // Optional: hard cleanup when wireframe fully revealed/finished
+    // Subtle, synced pulse for emissive and real lights
+    const elapsedTime = state.clock.getElapsedTime()
+    const pulse = (Math.sin(elapsedTime * ENGINE_GLOW.pulseSpeed) * 0.5 + 0.5) // 0..1
+    const emissive = ENGINE_GLOW.baseIntensity + pulse * ENGINE_GLOW.pulseIntensity
+    const lightIntensity = ENGINE_LIGHT.intensityBase + pulse * ENGINE_LIGHT.intensityPulse
+
+    animatedEngineMats.current.forEach((mat) => (mat.emissiveIntensity = emissive))
+    engineLightsRef.current.forEach((l) => (l.intensity = lightIntensity))
+
     const pWire = introUniforms?.uWireProgress?.value ?? 0
     if (pWire >= 0.999 && wireRef.current.cleanup) {
       wireRef.current.cleanup()
@@ -457,23 +478,34 @@ function SpaceStation({ scale = 0.6, onGlowTargets, introUniforms, showWireframe
 function SceneContent() {
   const [glowSelection, setGlowSelection] = useState([])
   const [introFinished, setIntroFinished] = useState(false)
+  const [parallaxEnabled, setParallaxEnabled] = useState(false)
+  const { camera } = useThree()
 
-  // Independent timelines: wireframe and splash/mesh
-  const wireProgressRef = useRef({ value: -1 })
-  const splashProgressRef = useRef({ value: -1 })
+  // === Camera Animation Setup ===
+  const CAM_START = useMemo(() => new THREE.Vector3(-8.5, 7.2, 16.0), [])
+  const CAM_END = useMemo(() => new THREE.Vector3(-5.2, -0.3, 8.0), [])
+  const CAM_LOOK_AT = useMemo(() => new THREE.Vector3(0, 0, 0), [])
 
-  // Tweak these to control start times and durations
+  // === THE CONTROL KNOB for camera start time ===
+  const CAMERA_DELAY_MS = 0
+  const CAMERA_TOTAL_SECONDS = 7.5
+
+  // --- Animation Timelines ---
+  const wireProgressRef = useRef({ value: -1, isAnimating: false })
+  const splashProgressRef = useRef({ value: -1, isAnimating: false })
+  const cameraProgressRef = useRef({ value: -1, isAnimating: false })
+
   const WIRE_DELAY_MS = 2500
   const SPLASH_DELAY_MS = 500
-  // Duration for each to go from -1 → +1 (two units total)
   const WIRE_TOTAL_SECONDS = 3.5
   const SPLASH_TOTAL_SECONDS = 6
 
-  // Optional: control spatial sweep speed (the radius factor in shaders)
-  // Increase for faster spatial expansion, decrease for slower
-  // You can also expose these as uniforms if you want to tweak live.
-  // Currently hard-coded in shaders as 15.0.
-
+  // Set initial camera
+  useEffect(() => {
+    camera.position.copy(CAM_START)
+    camera.lookAt(CAM_LOOK_AT)
+  }, [camera, CAM_START, CAM_LOOK_AT])
+  
   const introUniforms = useMemo(() => ({
     uWireProgress: wireProgressRef.current,
     uSplashProgress: splashProgressRef.current,
@@ -481,21 +513,18 @@ function SceneContent() {
     uTime: { value: 0 },
   }), [])
 
+  // Start the animations after delays
   useEffect(() => {
-    const t1 = setTimeout(() => {
-      wireProgressRef.current.isAnimating = true
-    }, WIRE_DELAY_MS)
-    const t2 = setTimeout(() => {
-      splashProgressRef.current.isAnimating = true
-    }, SPLASH_DELAY_MS)
-    return () => { clearTimeout(t1); clearTimeout(t2) }
+    const t1 = setTimeout(() => { wireProgressRef.current.isAnimating = true }, WIRE_DELAY_MS)
+    const t2 = setTimeout(() => { splashProgressRef.current.isAnimating = true }, SPLASH_DELAY_MS)
+    const t3 = setTimeout(() => { cameraProgressRef.current.isAnimating = true }, CAMERA_DELAY_MS)
+    return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3) }
   }, [])
 
   useFrame((state, dt) => {
     introUniforms.uTime.value = state.clock.elapsedTime
 
     const advance = (ref, totalSeconds) => {
-      // Move -1 → +1 over totalSeconds (2 units / second)
       if (ref.current.isAnimating && ref.current.value < 1) {
         const unitsPerSecond = 2 / totalSeconds
         ref.current.value = Math.min(1, ref.current.value + unitsPerSecond * dt)
@@ -504,8 +533,19 @@ function SceneContent() {
 
     advance(wireProgressRef, WIRE_TOTAL_SECONDS)
     advance(splashProgressRef, SPLASH_TOTAL_SECONDS)
+    advance(cameraProgressRef, CAMERA_TOTAL_SECONDS)
 
-    // Hide wireframe overlay when it's done
+    // Animate Camera
+    const camProgress = (cameraProgressRef.current.value + 1) / 2
+    if (camProgress < 1) {
+      const easedCam = easeInOutQuint(camProgress)
+      camera.position.lerpVectors(CAM_START, CAM_END, easedCam)
+      camera.lookAt(CAM_LOOK_AT)
+    } else if (!parallaxEnabled) {
+      camera.position.copy(CAM_END)
+      setParallaxEnabled(true)
+    }
+
     if (!introFinished && wireProgressRef.current.value >= 1) {
       setIntroFinished(true)
     }
@@ -513,17 +553,18 @@ function SceneContent() {
 
   return (
     <>
-      <ParallaxRig>
-        <ColoredStars count={1200} radius={120} depth={40} />
-        <StarFlares count={100} radius={115} minIdle={1.0} maxIdle={3.0} minDur={1.6} maxDur={2.6} />
-        <NebulaFog color="#0c1840" opacity={0.05} scale={200} />
+      <ParallaxRig enabled={parallaxEnabled}>
+        <ColoredStars count={1200} radius={120} depth={40} introUniforms={introUniforms} />
+        <StarFlares count={100} radius={115} minIdle={1.0} maxIdle={3.0} minDur={1.6} maxDur={2.6} introUniforms={introUniforms} />
+        <NebulaFog color="#0c1840" opacity={0.05} scale={200} introUniforms={introUniforms} />
 
-        <spotLight castShadow color="#ffffff" intensity={1.35} angle={0.55} penumbra={0.9} position={[6, 6, 6]} distance={35} shadow-bias={-0.00025} shadow-normalBias={0.03} shadow-mapSize-width={2048} shadow-mapSize-height={2048} />
+        <spotLight castShadow color="#ffffff" intensity={1.35} angle={0.55} penumbra={0.9} position={[6, 6, 6]} distance={35}
+                   shadow-bias={-0.00025} shadow-normalBias={0.03} shadow-mapSize-width={2048} shadow-mapSize-height={2048} />
         <directionalLight color="#9ec2ff" intensity={1.65} position={[-6, 3, 4]} />
         <directionalLight color="#9ec2ff" intensity={1.65} position={[-6, 3, -4]} />
         <directionalLight color="#9ec2ff" intensity={3.65} position={[6, 3, -4]} />
-        <ambientLight intensity={5.0} />
-        <hemisphereLight intensity={1.12} color="#dfe7ff" groundColor="#0b0b10" />
+        <ambientLight intensity={6.0} />
+        <hemisphereLight intensity={2.12} color="#dfe7ff" groundColor="#0b0b10" />
 
         <Suspense fallback={null}>
           <Environment preset="night" background={false} blur={0.2} />
@@ -538,19 +579,27 @@ function SceneContent() {
       </ParallaxRig>
 
       <EffectComposer disableNormalPass>
-        {/* CHANGED: raise threshold so faint wireframe lines don't bloom */}
-        <SelectiveBloom selection={glowSelection} intensity={0.5} radius={0.75} luminanceThreshold={0.7} luminanceSmoothing={0} mipmapBlur />
+        <SelectiveBloom
+          selection={glowSelection}     // engines + particles (restored)
+          intensity={0.7} // MODIFIED: Increased for more "punch" from the glows
+          radius={0.75}
+          luminanceThreshold={0.7}
+          luminanceSmoothing={0}
+          mipmapBlur
+        />
         <Vignette eskil offset={0.18} darkness={0.58} />
       </EffectComposer>
     </>
   )
 }
 
-function ParallaxRig({ children, yaw = 0.045, pitch = 0.03, pos = 0.07, ease = 7.8, deadzone = 0.012, mobileScale = 0.6 }) {
+function ParallaxRig({ children, yaw = 0.045, pitch = 0.03, pos = 0.07, ease = 7.8, deadzone = 0.012, mobileScale = 0.6, enabled = true }) {
   const rig = useRef()
   const { pointer, size } = useThree()
 
   useFrame((_, dt) => {
+    if (!enabled) return;
+
     const scale = size.width < 1024 ? mobileScale : 1
     let px = THREE.MathUtils.clamp(pointer.x || 0, -1, 1)
     let py = THREE.MathUtils.clamp(pointer.y || 0, -1, 1)
@@ -571,11 +620,56 @@ function ParallaxRig({ children, yaw = 0.045, pitch = 0.03, pos = 0.07, ease = 7
   return <group ref={rig}>{children}</group>
 }
 
-function NebulaFog({ color = '#0a1636', opacity = 0.07, scale = 180 }) {
+// Background fog also reveals with splash
+function NebulaFog({ color = '#0a1636', opacity = 0.07, scale = 180, introUniforms }) {
   return (
     <mesh scale={scale}>
       <sphereGeometry args={[1, 32, 32]} />
-      <meshBasicMaterial color={color} side={THREE.BackSide} transparent opacity={opacity} depthWrite={false} blending={THREE.AdditiveBlending} />
+      <meshBasicMaterial
+        color={color}
+        side={THREE.BackSide}
+        transparent
+        opacity={opacity}
+        depthWrite={false}
+        blending={THREE.AdditiveBlending}
+        onBeforeCompile={(shader) => {
+          if (!introUniforms) return
+          shader.uniforms.uSplashProgress = introUniforms.uSplashProgress
+          shader.uniforms.uIntroStartPoint = introUniforms.uIntroStartPoint
+          shader.uniforms.uTime = introUniforms.uTime
+          shader.uniforms.uBgRadius = { value: 240.0 }
+          shader.uniforms.uBgEdge = { value: 10.0 }
+
+          shader.vertexShader = `
+            varying vec3 vWorldPosition;
+            ${shader.vertexShader}
+          `.replace(
+            '#include <begin_vertex>',
+            '#include <begin_vertex>\n vWorldPosition = (modelMatrix * vec4(transformed, 1.0)).xyz;'
+          )
+
+          shader.fragmentShader = `
+            uniform float uSplashProgress;
+            uniform vec3 uIntroStartPoint;
+            uniform float uTime;
+            uniform float uBgRadius;
+            uniform float uBgEdge;
+            varying vec3 vWorldPosition;
+            ${shader.fragmentShader}
+          `.replace(
+            /\}\s*$/,
+            `
+              float t = smoothstep(0.0, 1.0, uSplashProgress);
+              float dist = distance(vWorldPosition, uIntroStartPoint);
+              float revealRadius = t * uBgRadius;
+              float op = 1.0 - smoothstep(revealRadius - uBgEdge, revealRadius, dist);
+              float ripple = 0.98 + 0.02 * sin(dist * 0.5 - uTime * 2.5);
+              gl_FragColor.a *= op * ripple;
+              if (gl_FragColor.a < 0.005) discard;
+            }`
+          )
+        }}
+      />
     </mesh>
   )
 }
@@ -600,8 +694,9 @@ function useFlareTexture() {
   }, [])
 }
 
+// Lens flares that also reveal with splash
 function StarFlares({
-  count = 100, radius = 115, minIdle = 1.0, maxIdle = 3.0, minDur = 1.6, maxDur = 2.6, baseScale = 0.18, maxScale = 1.1, color = '#a6c8ff'
+  count = 100, radius = 115, minIdle = 1.0, maxIdle = 3.0, minDur = 1.6, maxDur = 2.6, baseScale = 0.18, maxScale = 1.1, color = '#a6c8ff', introUniforms
 }) {
   const matTex = useFlareTexture()
   const refs = useRef([])
@@ -616,7 +711,11 @@ function StarFlares({
   }
 
   useMemo(() => {
-    states.current = Array.from({ length: count }).map(() => ({ t: -(rand(minIdle, maxIdle)), dur: rand(minDur, maxDur), pos: randOnSphere(radius) }))
+    states.current = Array.from({ length: count }).map(() => ({
+      t: -(rand(minIdle, maxIdle)),
+      dur: rand(minDur, maxDur),
+      pos: randOnSphere(radius)
+    }))
   }, [count, minIdle, maxIdle, minDur, maxDur, radius])
 
   useFrame((_, dt) => {
@@ -646,15 +745,71 @@ function StarFlares({
   return (
     <group frustumCulled={false}>
       {Array.from({ length: count }).map((_, i) => (
-        <sprite key={i} ref={(el) => (refs.current[i] = el)} position={states.current[i]?.pos || [0, 0, -radius]} scale={[baseScale, baseScale, 1]} frustumCulled={false}>
-          <spriteMaterial map={matTex} color={color} transparent opacity={0} depthWrite={false} depthTest blending={THREE.AdditiveBlending} toneMapped={false} />
+        <sprite
+          key={i}
+          ref={(el) => (refs.current[i] = el)}
+          position={states.current[i]?.pos || [0, 0, -radius]}
+          scale={[baseScale, baseScale, 1]}
+          frustumCulled={false}
+        >
+          <spriteMaterial
+            map={matTex}
+            color={color}
+            transparent
+            opacity={0}
+            depthWrite={false}
+            depthTest
+            blending={THREE.AdditiveBlending}
+            toneMapped={false}
+            onBeforeCompile={(shader) => {
+              if (!introUniforms) return
+              shader.uniforms.uSplashProgress = introUniforms.uSplashProgress
+              shader.uniforms.uIntroStartPoint = introUniforms.uIntroStartPoint
+              shader.uniforms.uTime = introUniforms.uTime
+              shader.uniforms.uBgRadius = { value: 220.0 }
+              shader.uniforms.uBgEdge = { value: 8.0 }
+
+              shader.vertexShader = shader.vertexShader
+                .replace('void main() {', `varying vec3 vWorldPosition; void main() {`)
+                .replace(
+                  'gl_Position = projectionMatrix * mvPosition;',
+                  `vWorldPosition = (modelMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+                   gl_Position = projectionMatrix * mvPosition;`
+                )
+
+              shader.fragmentShader = shader.fragmentShader
+                .replace(
+                  'void main() {',
+                  `uniform float uSplashProgress;
+                   uniform vec3 uIntroStartPoint;
+                   uniform float uTime;
+                   uniform float uBgRadius;
+                   uniform float uBgEdge;
+                   varying vec3 vWorldPosition;
+                   void main() {`
+                )
+                .replace(
+                  /\}\s*$/,
+                  `
+                    float t = smoothstep(0.0, 1.0, uSplashProgress);
+                    float dist = distance(vWorldPosition, uIntroStartPoint);
+                    float revealRadius = t * uBgRadius;
+                    float op = 1.0 - smoothstep(revealRadius - uBgEdge, revealRadius, dist);
+                    float ripple = 0.98 + 0.02 * sin(dist * 0.6 - uTime * 3.0);
+                    gl_FragColor.a *= op * ripple;
+                    if (gl_FragColor.a < 0.01) discard;
+                  }`
+                )
+            }}
+          />
         </sprite>
       ))}
     </group>
   )
 }
 
-function ColoredStars({ count = 1200, radius = 120, depth = 40, small=0.65, medium=1.2, large=2.0 }) {
+// Star field that also reveals with splash
+function ColoredStars({ count = 1200, radius = 120, depth = 40, small=0.65, medium=1.2, large=2.0, introUniforms }) {
   const starTex = useMemo(() => {
     const size = 128
     const c = document.createElement('canvas')
@@ -665,7 +820,7 @@ function ColoredStars({ count = 1200, radius = 120, depth = 40, small=0.65, medi
     grd.addColorStop(0.35, 'rgba(255,255,255,0.7)')
     grd.addColorStop(1.0, 'rgba(0,0,0,0)')
     ctx.fillStyle = grd
-    ctx.fillRect(0, 0, size, 0 + size)
+    ctx.fillRect(0, 0, size, size)
     const tex = new THREE.CanvasTexture(c)
     tex.colorSpace = THREE.SRGBColorSpace
     tex.anisotropy = 4
@@ -722,16 +877,89 @@ function ColoredStars({ count = 1200, radius = 120, depth = 40, small=0.65, medi
   const geoMed   = useMemo(() => makeCloud(nMed), [makeCloud, nMed])
   const geoLarge = useMemo(() => makeCloud(nLarge), [makeCloud, nLarge])
 
+  const splashifyPoints = (shader) => {
+    if (!introUniforms) return
+    shader.uniforms.uSplashProgress = introUniforms.uSplashProgress
+    shader.uniforms.uIntroStartPoint = introUniforms.uIntroStartPoint
+    shader.uniforms.uTime = introUniforms.uTime
+    shader.uniforms.uBgRadius = { value: 220.0 }
+    shader.uniforms.uBgEdge = { value: 8.0 }
+
+    shader.vertexShader = shader.vertexShader
+      .replace('void main() {', `varying vec3 vWorldPosition; void main() {`)
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\n vWorldPosition = (modelMatrix * vec4(transformed, 1.0)).xyz;')
+
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        'void main() {',
+        `uniform float uSplashProgress;
+         uniform vec3 uIntroStartPoint;
+         uniform float uTime;
+         uniform float uBgRadius;
+         uniform float uBgEdge;
+         varying vec3 vWorldPosition;
+         void main() {`
+      )
+      .replace(
+        /\}\s*$/,
+        `
+          float t = smoothstep(0.0, 1.0, uSplashProgress);
+          float dist = distance(vWorldPosition, uIntroStartPoint);
+          float revealRadius = t * uBgRadius;
+          float op = 1.0 - smoothstep(revealRadius - uBgEdge, revealRadius, dist);
+          float ripple = 0.985 + 0.015 * sin(dist * 0.7 - uTime * 3.2);
+          gl_FragColor.a *= op * ripple;
+          if (gl_FragColor.a < 0.01) discard;
+        }`
+      )
+  }
+
   return (
     <group frustumCulled={false}>
       <points geometry={geoSmall} frustumCulled={false}>
-        <pointsMaterial map={starTex} vertexColors transparent opacity={0.9} size={small} sizeAttenuation depthWrite={false} blending={THREE.AdditiveBlending} toneMapped={false} />
+        <pointsMaterial
+          map={starTex}
+          vertexColors
+          transparent
+          opacity={0.9}
+          size={small}
+          sizeAttenuation
+          depthWrite={false}
+          depthTest
+          blending={THREE.AdditiveBlending}
+          toneMapped={false}
+          onBeforeCompile={splashifyPoints}
+        />
       </points>
       <points geometry={geoMed} frustumCulled={false}>
-        <pointsMaterial map={starTex} vertexColors transparent opacity={0.95} size={medium} sizeAttenuation depthWrite={false} blending={THREE.AdditiveBlending} toneMapped={false} />
+        <pointsMaterial
+          map={starTex}
+          vertexColors
+          transparent
+          opacity={0.95}
+          size={medium}
+          sizeAttenuation
+          depthWrite={false}
+          depthTest
+          blending={THREE.AdditiveBlending}
+          toneMapped={false}
+          onBeforeCompile={splashifyPoints}
+        />
       </points>
       <points geometry={geoLarge} frustumCulled={false}>
-        <pointsMaterial map={starTex} vertexColors transparent opacity={1.0} size={large} sizeAttenuation depthWrite={false} blending={THREE.AdditiveBlending} toneMapped={false} />
+        <pointsMaterial
+          map={starTex}
+          vertexColors
+          transparent
+          opacity={1.0}
+          size={large}
+          sizeAttenuation
+          depthWrite={false}
+          depthTest
+          blending={THREE.AdditiveBlending}
+          toneMapped={false}
+          onBeforeCompile={splashifyPoints}
+        />
       </points>
     </group>
   )
@@ -743,11 +971,11 @@ function App() {
       <Canvas
         shadows
         dpr={[1, 2]}
-        camera={{ position: [-5.2, -0.3, 8], fov: 50 }}
+        camera={{ fov: 50 }}
         gl={{
           antialias: true,
           alpha: false,
-          physicallyCorrectLights: true,
+          physicallyCorrectLights: true,      // Realistic light falloff enabled
           outputColorSpace: THREE.SRGBColorSpace,
           toneMapping: THREE.ACESFilmicToneMapping,
           toneMappingExposure: 0.95
